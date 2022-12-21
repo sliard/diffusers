@@ -22,9 +22,9 @@ import torch
 
 from diffusers import AutoencoderKL, PNDMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel
 from diffusers.utils import floats_tensor, load_image, load_numpy, torch_device
-from diffusers.utils.testing_utils import require_torch_gpu, slow
+from diffusers.utils.testing_utils import require_torch_gpu
 from PIL import Image
-from transformers import CLIPImageProcessor, CLIPTextConfig, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 from ...test_pipelines_common import PipelineTesterMixin
 
@@ -32,12 +32,26 @@ from ...test_pipelines_common import PipelineTesterMixin
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
-class StableDiffusion2InpaintPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
-    pipeline_class = StableDiffusionInpaintPipeline
+class StableDiffusionInpaintPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
+    def tearDown(self):
+        # clean up the VRAM after each test
+        super().tearDown()
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    def get_dummy_components(self):
+    @property
+    def dummy_image(self):
+        batch_size = 1
+        num_channels = 3
+        sizes = (32, 32)
+
+        image = floats_tensor((batch_size, num_channels) + sizes, rng=random.Random(0)).to(torch_device)
+        return image
+
+    @property
+    def dummy_cond_unet_inpaint(self):
         torch.manual_seed(0)
-        unet = UNet2DConditionModel(
+        model = UNet2DConditionModel(
             block_out_channels=(32, 64),
             layers_per_block=2,
             sample_size=32,
@@ -50,19 +64,25 @@ class StableDiffusion2InpaintPipelineFastTests(PipelineTesterMixin, unittest.Tes
             attention_head_dim=(2, 4, 8, 8),
             use_linear_projection=True,
         )
-        scheduler = PNDMScheduler(skip_prk_steps=True)
+        return model
+
+    @property
+    def dummy_vae(self):
         torch.manual_seed(0)
-        vae = AutoencoderKL(
+        model = AutoencoderKL(
             block_out_channels=[32, 64],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
-            sample_size=128,
         )
+        return model
+
+    @property
+    def dummy_text_encoder(self):
         torch.manual_seed(0)
-        text_encoder_config = CLIPTextConfig(
+        config = CLIPTextConfig(
             bos_token_id=0,
             eos_token_id=2,
             hidden_size=32,
@@ -76,60 +96,129 @@ class StableDiffusion2InpaintPipelineFastTests(PipelineTesterMixin, unittest.Tes
             hidden_act="gelu",
             projection_dim=512,
         )
-        text_encoder = CLIPTextModel(text_encoder_config)
-        tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
-        feature_extractor = CLIPImageProcessor(crop_size=32, size=32)
+        return CLIPTextModel(config)
 
-        components = {
-            "unet": unet,
-            "scheduler": scheduler,
-            "vae": vae,
-            "text_encoder": text_encoder,
-            "tokenizer": tokenizer,
-            "safety_checker": None,
-            "feature_extractor": feature_extractor,
-        }
-        return components
+    @property
+    def dummy_extractor(self):
+        def extract(*args, **kwargs):
+            class Out:
+                def __init__(self):
+                    self.pixel_values = torch.ones([0])
 
-    def get_dummy_inputs(self, device, seed=0):
-        # TODO: use tensor inputs instead of PIL, this is here just to leave the old expected_slices untouched
-        image = floats_tensor((1, 3, 32, 32), rng=random.Random(seed)).to(device)
-        image = image.cpu().permute(0, 2, 3, 1)[0]
-        init_image = Image.fromarray(np.uint8(image)).convert("RGB").resize((64, 64))
-        mask_image = Image.fromarray(np.uint8(image + 4)).convert("RGB").resize((64, 64))
-        if str(device).startswith("mps"):
-            generator = torch.manual_seed(seed)
-        else:
-            generator = torch.Generator(device=device).manual_seed(seed)
-        inputs = {
-            "prompt": "A painting of a squirrel eating a burger",
-            "image": init_image,
-            "mask_image": mask_image,
-            "generator": generator,
-            "num_inference_steps": 2,
-            "guidance_scale": 6.0,
-            "output_type": "numpy",
-        }
-        return inputs
+                def to(self, device):
+                    self.pixel_values.to(device)
+                    return self
+
+            return Out()
+
+        return extract
 
     def test_stable_diffusion_inpaint(self):
         device = "cpu"  # ensure determinism for the device-dependent torch.Generator
-        components = self.get_dummy_components()
-        sd_pipe = StableDiffusionInpaintPipeline(**components)
+        unet = self.dummy_cond_unet_inpaint
+        scheduler = PNDMScheduler(skip_prk_steps=True)
+        vae = self.dummy_vae
+        text_encoder = self.dummy_text_encoder
+        tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
+
+        image = self.dummy_image.cpu().permute(0, 2, 3, 1)[0]
+        init_image = Image.fromarray(np.uint8(image)).convert("RGB").resize((64, 64))
+        mask_image = Image.fromarray(np.uint8(image + 4)).convert("RGB").resize((64, 64))
+
+        # make sure here that pndm scheduler skips prk
+        sd_pipe = StableDiffusionInpaintPipeline(
+            unet=unet,
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            safety_checker=None,
+            feature_extractor=None,
+        )
         sd_pipe = sd_pipe.to(device)
         sd_pipe.set_progress_bar_config(disable=None)
 
-        inputs = self.get_dummy_inputs(device)
-        image = sd_pipe(**inputs).images
+        prompt = "A painting of a squirrel eating a burger"
+        generator = torch.Generator(device=device).manual_seed(0)
+        output = sd_pipe(
+            [prompt],
+            generator=generator,
+            guidance_scale=6.0,
+            num_inference_steps=2,
+            output_type="np",
+            image=init_image,
+            mask_image=mask_image,
+        )
+
+        image = output.images
+
+        generator = torch.Generator(device=device).manual_seed(0)
+        image_from_tuple = sd_pipe(
+            [prompt],
+            generator=generator,
+            guidance_scale=6.0,
+            num_inference_steps=2,
+            output_type="np",
+            image=init_image,
+            mask_image=mask_image,
+            return_dict=False,
+        )[0]
+
         image_slice = image[0, -3:, -3:, -1]
+        image_from_tuple_slice = image_from_tuple[0, -3:, -3:, -1]
 
         assert image.shape == (1, 64, 64, 3)
         expected_slice = np.array([0.4727, 0.5735, 0.3941, 0.5446, 0.5926, 0.4394, 0.5062, 0.4654, 0.4476])
 
         assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+        assert np.abs(image_from_tuple_slice.flatten() - expected_slice).max() < 1e-2
+
+    @unittest.skipIf(torch_device != "cuda", "This test requires a GPU")
+    def test_stable_diffusion_inpaint_fp16(self):
+        """Test that stable diffusion inpaint works with fp16"""
+        unet = self.dummy_cond_unet_inpaint
+        scheduler = PNDMScheduler(skip_prk_steps=True)
+        vae = self.dummy_vae
+        text_encoder = self.dummy_text_encoder
+        tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
+
+        image = self.dummy_image.cpu().permute(0, 2, 3, 1)[0]
+        init_image = Image.fromarray(np.uint8(image)).convert("RGB").resize((64, 64))
+        mask_image = Image.fromarray(np.uint8(image + 4)).convert("RGB").resize((64, 64))
+
+        # put models in fp16
+        unet = unet.half()
+        vae = vae.half()
+        text_encoder = text_encoder.half()
+
+        # make sure here that pndm scheduler skips prk
+        sd_pipe = StableDiffusionInpaintPipeline(
+            unet=unet,
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            safety_checker=None,
+            feature_extractor=None,
+        )
+        sd_pipe = sd_pipe.to(torch_device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        prompt = "A painting of a squirrel eating a burger"
+        generator = torch.Generator(device=torch_device).manual_seed(0)
+        image = sd_pipe(
+            [prompt],
+            generator=generator,
+            num_inference_steps=2,
+            output_type="np",
+            image=init_image,
+            mask_image=mask_image,
+        ).images
+
+        assert image.shape == (1, 64, 64, 3)
 
 
-@slow
+# @slow
 @require_torch_gpu
 class StableDiffusionInpaintPipelineIntegrationTests(unittest.TestCase):
     def tearDown(self):
@@ -188,6 +277,7 @@ class StableDiffusionInpaintPipelineIntegrationTests(unittest.TestCase):
         model_id = "stabilityai/stable-diffusion-2-inpainting"
         pipe = StableDiffusionInpaintPipeline.from_pretrained(
             model_id,
+            revision="fp16",
             torch_dtype=torch.float16,
             safety_checker=None,
         )
@@ -230,6 +320,7 @@ class StableDiffusionInpaintPipelineIntegrationTests(unittest.TestCase):
             safety_checker=None,
             scheduler=pndm,
             device_map="auto",
+            revision="fp16",
             torch_dtype=torch.float16,
         )
         pipe.to(torch_device)

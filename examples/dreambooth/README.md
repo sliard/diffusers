@@ -1,3 +1,27 @@
+To reduce VRAM usage to 9.92 GB, pass `--gradient_checkpointing` and `--use_8bit_adam` flag to use 8 bit adam optimizer from [bitsandbytes](https://github.com/TimDettmers/bitsandbytes).
+
+Model with just [xformers](https://github.com/facebookresearch/xformers) memory efficient flash attention uses 15.79 GB VRAM with `--gradient_checkpointing` else 17.7 GB. Both have no loss in precision at all. gradient_checkpointing recalculates intermediate activations to save memory at cost of some speed.
+
+Caching the outputs of VAE and Text Encoder and freeing them also helped in reducing memory.
+
+You can now convert to ckpt format using this script to use in UIs like AUTOMATIC1111. https://github.com/ShivamShrirao/diffusers/raw/main/scripts/convert_diffusers_to_original_stable_diffusion.py Check colab notebook for example usage.
+
+[![DreamBooth Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ShivamShrirao/diffusers/blob/main/examples/dreambooth/DreamBooth_Stable_Diffusion.ipynb)
+
+Use the table below to choose the best flags based on your memory and speed requirements. Tested on Tesla T4 GPU.
+
+| `fp16` | `train_batch_size` | `gradient_accumulation_steps` | `gradient_checkpointing` | `use_8bit_adam` | GB VRAM usage | Speed (it/s) |
+| ---- | ------------------ | ----------------------------- | ----------------------- | --------------- | ---------- | ------------ |
+| fp16 | 1                  | 1                             | TRUE                    | TRUE            | 9.92       | 0.93         |
+| no   | 1                  | 1                             | TRUE                    | TRUE            | 10.08      | 0.42         |
+| fp16 | 2                  | 1                             | TRUE                    | TRUE            | 10.4       | 0.66         |
+| fp16 | 1                  | 1                             | FALSE                   | TRUE            | 11.17      | 1.14         |
+| no   | 1                  | 1                             | FALSE                   | TRUE            | 11.17      | 0.49         |
+| fp16 | 1                  | 2                             | TRUE                    | TRUE            | 11.56      | 1            |
+| fp16 | 2                  | 1                             | FALSE                   | TRUE            | 13.67      | 0.82         |
+| fp16 | 1                  | 2                             | FALSE                   | TRUE            | 13.7       | 0.83          |
+| fp16 | 1                  | 1                             | TRUE                    | FALSE           | 15.79      | 0.77         |
+
 # DreamBooth training example
 
 [DreamBooth](https://arxiv.org/abs/2208.12242) is a method to personalize text2image models like stable diffusion given just a few(3~5) images of a subject.
@@ -9,18 +33,9 @@ The `train_dreambooth.py` script shows how to implement the training procedure a
 
 Before running the scripts, make sure to install the library's training dependencies:
 
-**Important**
-
-To make sure you can successfully run the latest versions of the example scripts, we highly recommend **installing from source** and keeping the install up to date as we update the example scripts frequently and install some example-specific requirements. To do this, execute the following steps in a new virtual environment:
 ```bash
-git clone https://github.com/huggingface/diffusers
-cd diffusers
-pip install -e .
-```
-
-Then cd in the example folder and run
-```bash
-pip install -r requirements.txt
+pip install git+https://github.com/ShivamShrirao/diffusers.git
+pip install -U -r requirements.txt
 ```
 
 And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) environment with:
@@ -29,26 +44,25 @@ And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) e
 accelerate config
 ```
 
-Or for a default accelerate configuration without answering questions about your environment
+### Dog toy example
+
+You need to accept the model license before downloading or using the weights. In this example we'll use model version `v1-4`, so you'll need to visit [its card](https://huggingface.co/CompVis/stable-diffusion-v1-4), read the license and tick the checkbox if you agree. 
+
+You have to be a registered user in 🤗 Hugging Face Hub, and you'll also need to use an access token for the code to work. For more information on access tokens, please refer to [this section of the documentation](https://huggingface.co/docs/hub/security-tokens).
+
+Run the following command to authenticate your token
 
 ```bash
-accelerate config default
+huggingface-cli login
 ```
 
-Or if your environment doesn't support an interactive shell e.g. a notebook
+If you have already cloned the repo, then you won't need to go through these steps.
 
-```python
-from accelerate.utils import write_basic_config
-write_basic_config()
-```
-
-### Dog toy example
+<br>
 
 Now let's get our dataset. Download images from [here](https://drive.google.com/drive/folders/1BO_dyz-p65qhBRRMRA4TbZ8qW4rB99JZ) and save them in a directory. This will be our training data.
 
 And launch the training using
-
-**___Note: Change the `resolution` to 768 if you are using the [stable-diffusion-2](https://huggingface.co/stabilityai/stable-diffusion-2) 768x768 model.___**
 
 ```bash
 export MODEL_NAME="CompVis/stable-diffusion-v1-4"
@@ -72,7 +86,7 @@ accelerate launch train_dreambooth.py \
 ### Training with prior-preservation loss
 
 Prior-preservation is used to avoid overfitting and language-drift. Refer to the paper to learn more about it. For prior-preservation we first generate images using the model with a class prompt and then use those during training along with our data.
-According to the paper, it's recommended to generate `num_epochs * num_samples` images for prior-preservation. 200-300 works well for most cases. The `num_class_images` flag sets the number of images to generate with the class prompt. You can place existing images in `class_data_dir`, and the training script will generate any additional images so that `num_class_images` are present in `class_data_dir` during training time.
+According to the paper, it's recommended to generate `num_epochs * num_samples` images for prior-preservation. 200-300 works well for most cases.
 
 ```bash
 export MODEL_NAME="CompVis/stable-diffusion-v1-4"
@@ -176,8 +190,6 @@ accelerate launch --mixed_precision="fp16" train_dreambooth.py \
 The script also allows to fine-tune the `text_encoder` along with the `unet`. It's been observed experimentally that fine-tuning `text_encoder` gives much better results especially on faces. 
 Pass the `--train_text_encoder` argument to the script to enable training `text_encoder`.
 
-___Note: Training text encoder requires more memory, with this option the training won't fit on 16GB GPU. It needs at least 24GB VRAM.___
-
 ```bash
 export MODEL_NAME="CompVis/stable-diffusion-v1-4"
 export INSTANCE_DIR="path-to-instance-images"
@@ -204,17 +216,6 @@ accelerate launch train_dreambooth.py \
   --max_train_steps=800
 ```
 
-### Using DreamBooth for other pipelines than Stable Diffusion
-
-Altdiffusion also support dreambooth now, the runing comman is basically the same as abouve, all you need to do is replace the `MODEL_NAME` like this:
-One can now simply change the `pretrained_model_name_or_path` to another architecture such as [`AltDiffusion`](https://huggingface.co/docs/diffusers/api/pipelines/alt_diffusion).
-
-```
-export MODEL_NAME="CompVis/stable-diffusion-v1-4" --> export MODEL_NAME="BAAI/AltDiffusion-m9"
-or
-export MODEL_NAME="CompVis/stable-diffusion-v1-4" --> export MODEL_NAME="BAAI/AltDiffusion"
-```
-
 ### Inference
 
 Once you have trained a model using above command, the inference can be done simply using the `StableDiffusionPipeline`. Make sure to include the `identifier`(e.g. sks in above example) in your prompt.
@@ -232,11 +233,8 @@ image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
 image.save("dog-bucket.png")
 ```
 
-### Inference from a training checkpoint
 
-You can also perform inference from one of the checkpoints saved during the training process, if you used the `--checkpointing_steps` argument. Please, refer to [the documentation](https://huggingface.co/docs/diffusers/main/en/training/dreambooth#performing-inference-using-a-saved-checkpoint) to see how to do it.
-
-## Training with Flax/JAX
+## Running with Flax/JAX
 
 For faster training on TPUs and GPUs you can leverage the flax training example. Follow the instructions above to get the model and dataset before running the script.
 
@@ -316,5 +314,3 @@ python train_dreambooth_flax.py \
   --num_class_images=200 \
   --max_train_steps=800
 ```
-
-You can also use Dreambooth to train the specialized in-painting model. See [the script in the research folder for details](https://github.com/huggingface/diffusers/tree/main/examples/research_projects/dreambooth_inpaint).
