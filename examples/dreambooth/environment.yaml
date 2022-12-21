@@ -17,3 +17,4 @@ dependencies:
       - tensorboard
       - modelcards
       - -e git+https://github.com/huggingface/diffusers.git#egg=diffusers
+# export LD_LIBRARY_PATH=/opt/conda/envs/diff/lib/python3.8/site-packages/nvidia/cublas/lib/:$LD_LIBRARY_PATH
